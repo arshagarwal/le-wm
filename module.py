@@ -1,3 +1,4 @@
+import math
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -283,3 +284,76 @@ class ARPredictor(nn.Module):
         x = self.dropout(x)
         x = self.transformer(x, c)
         return x
+
+
+##############################
+## CLAW latent action model ##
+##############################
+
+
+class _GradReverse(torch.autograd.Function):
+    """Identity in the forward pass, gradient multiplied by -scale in the backward pass."""
+
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return -ctx.scale * grad, None
+
+
+def grad_reverse(x, scale=1.0):
+    return _GradReverse.apply(x, float(scale))
+
+
+def adv_delta(progress, gamma=10.0, max_delta=0.999):
+    """CLAW Eq. 2: delta = min(2 / (1 + exp(-gamma * p)) - 1, max_delta), p in [0, 1]."""
+    p = min(max(float(progress), 0.0), 1.0)
+    return min(2.0 / (1.0 + math.exp(-gamma * p)) - 1.0, max_delta)
+
+
+class LatentActionModel(nn.Module):
+    """Infers an l2-normalized latent action from two consecutive embeddings.
+
+    input: (emb_t, emb_{t+1}), each (..., D) -> z: (..., latent_dim)
+    """
+
+    def __init__(self, emb_dim, latent_dim=32, hidden_dim=512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2 * emb_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+
+    def forward(self, emb_t, emb_next):
+        x = torch.cat([emb_t, emb_next - emb_t], dim=-1)
+        return F.normalize(self.net(x), dim=-1)
+
+
+class GroundedActionEncoder(nn.Module):
+    """Maps a real action to the latent action space (unit-norm, latent_dim).
+
+    Trained against the (detached) output of the LatentActionModel so planners
+    that search over real actions can still condition the predictor.
+    """
+
+    def __init__(self, input_dim=10, latent_dim=32, hidden_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+
+    def forward(self, x):
+        """x: (B, T, input_dim) -> (B, T, latent_dim)"""
+        return F.normalize(self.net(x.float()), dim=-1)

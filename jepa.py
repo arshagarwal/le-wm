@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 
+from module import grad_reverse
+
 def detach_clone(v):
     return v.detach().clone() if torch.is_tensor(v) else v
 
@@ -17,14 +19,30 @@ class JEPA(nn.Module):
         action_encoder,
         projector=None,
         pred_proj=None,
+        lam=None,
+        action_proj=None,
+        emb_dim=None,
+        detach_lam_input=False,
     ):
         super().__init__()
 
         self.encoder = encoder
         self.predictor = predictor
-        self.action_encoder = action_encoder
         self.projector = projector or nn.Identity()
         self.pred_proj = pred_proj or nn.Identity()
+
+        # CLAW latent actions (off when `lam` is None: identical to plain LeWM)
+        self.lam = lam
+        self.detach_lam_input = detach_lam_input
+        if lam is None:
+            self.action_encoder = action_encoder
+        else:
+            assert action_proj is not None and emb_dim is not None
+            # action_encoder maps real actions -> latent z; action_proj maps z -> predictor conditioning
+            self.ground_encoder = action_encoder
+            self.action_proj = action_proj
+            self.action_encoder = nn.Sequential(action_encoder, action_proj)
+            self.null_token = nn.Parameter(torch.randn(1, 1, emb_dim) * 0.02)
 
     def encode(self, info):
         """Encode observations and actions into embeddings.
@@ -53,6 +71,33 @@ class JEPA(nn.Module):
         preds = self.pred_proj(rearrange(preds, "b t d -> (b t) d"))
         preds = rearrange(preds, "(b t) d -> b t d", b=emb.size(0))
         return preds
+
+    ########################
+    ## CLAW latent actions ##
+    ########################
+
+    def infer_latent_actions(self, emb):
+        """emb: (B, T, D) -> z: (B, T-1, latent_dim), one per consecutive pair."""
+        e = emb.detach() if self.detach_lam_input else emb
+        return self.lam(e[:, :-1], e[:, 1:])
+
+    def predict_null(self, z, delta):
+        """Adversarial pass: predict next embeddings from z alone (state replaced by a
+        learned null token). The gradient reaching z is reversed and scaled by delta."""
+        B, T = z.shape[:2]
+        null = self.null_token.expand(B, T, -1)
+        return self.predict(null, self.action_proj(grad_reverse(z, delta)))
+
+    def latent_forward(self, emb, action, ctx_len, delta):
+        """Everything the training loss needs from the latent-action branch.
+        emb: (B, T, D), action: (B, T, A) real actions (only used for grounding)."""
+        z = self.infer_latent_actions(emb)[:, :ctx_len]
+        return {
+            "z": z,
+            "act_emb": self.action_proj(z),
+            "adv_pred": self.predict_null(z, delta),
+            "ground_pred": self.ground_encoder(action[:, :ctx_len]),
+        }
 
     ####################
     ## Inference only ##

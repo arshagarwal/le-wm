@@ -10,7 +10,7 @@ import torch
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
-from module import SIGReg
+from module import SIGReg, adv_delta
 from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback
 
 
@@ -32,6 +32,17 @@ def lejepa_forward(self, batch, stage, cfg):
     ctx_emb = emb[:, :ctx_len]
     ctx_act = act_emb[:, : ctx_len]
 
+    # CLAW latent actions: z inferred from consecutive embeddings replaces the real-action conditioning
+    latent = getattr(self.model, "lam", None) is not None
+    if latent:
+        assert n_preds == 1, "latent actions assume num_preds == 1"
+        lcfg = cfg.loss.latent
+        trainer = getattr(self, "trainer", None)
+        progress = trainer.global_step / max(trainer.estimated_stepping_batches, 1) if trainer is not None else 0.0
+        delta = adv_delta(progress, lcfg.gamma, lcfg.max_delta)
+        lat = self.model.latent_forward(emb, batch["action"], ctx_len, delta)
+        ctx_act = lat["act_emb"]
+
     tgt_emb = emb[:, n_preds:] # label
     pred_emb = self.model.predict(ctx_emb, ctx_act) # pred
 
@@ -40,7 +51,29 @@ def lejepa_forward(self, batch, stage, cfg):
     output["sigreg_loss"]= self.sigreg(emb.transpose(0, 1))
     output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]  
 
+    metrics = {}
+    if latent:
+        adv_tgt = tgt_emb.detach() if lcfg.detach_target else tgt_emb
+        output["adv_loss"] = (lat["adv_pred"] - adv_tgt).pow(2).mean()
+        # z -> real-action grounding; z is detached so no action label reaches the LAM or predictor
+        output["ground_loss"] = (lat["ground_pred"] - lat["z"].detach()).pow(2).sum(-1).mean()
+        output["loss"] = output["loss"] + output["adv_loss"] + lcfg.w_ground * output["ground_loss"]
+
+        with torch.no_grad():
+            z = lat["z"].float().flatten(0, 1)  # (B*ctx, latent_dim)
+            sv = torch.linalg.svdvals(z - z.mean(0, keepdim=True))
+            p = sv / sv.sum().clamp_min(1e-8)
+            # adversary error relative to predicting the per-position batch mean (1.0 = no leakage)
+            base = (tgt_emb - tgt_emb.mean(0, keepdim=True)).pow(2).mean().clamp_min(1e-8)
+            metrics = {
+                "delta": torch.tensor(delta),
+                "z_std": z.std(0).mean(),
+                "z_erank": torch.exp(-(p * p.clamp_min(1e-12).log()).sum()),
+                "adv_rel": output["adv_loss"].detach() / base,
+            }
+
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
+    losses_dict.update({f"{stage}/{k}": v for k, v in metrics.items()})
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
     return output
 

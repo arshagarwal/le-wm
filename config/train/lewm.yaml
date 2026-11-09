@@ -12,6 +12,7 @@ train_split: 0.9
 seed: 3072
 img_size: 224
 embed_dim: 192
+latent_dim: 32  # only used when model=lewm_claw
 history_size: 3
 
 trainer:
@@ -41,3 +42,8 @@ loss:
     kwargs:
       knots: 17
       num_proj: 1024
+  latent:  # only used when model=lewm_claw
+    w_ground: 1.0
+    gamma: 10.0
+    max_delta: 0.999
+    detach_target: true
