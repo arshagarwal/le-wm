@@ -11,7 +11,7 @@ from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
 from module import SIGReg, adv_delta
-from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback
+from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback, StepCkptCallback
 
 
 def lejepa_forward(self, batch, stage, cfg):
@@ -154,15 +154,19 @@ def run(cfg):
         run_name=cfg.output_model_name, cfg=cfg.model, epoch_interval=1,
     )
 
+    ckpt_path = run_dir / f"{cfg.output_model_name}_weights.ckpt"
+    callbacks = [object_dump_callback]
+    if cfg.get("ckpt_every_n_steps", 0) > 0:
+        callbacks.append(StepCkptCallback(ckpt_path, cfg.ckpt_every_n_steps))
+
     trainer = pl.Trainer(
         **cfg.trainer,
-        callbacks=[object_dump_callback],
+        callbacks=callbacks,
         num_sanity_val_steps=1,
         logger=logger,
         enable_checkpointing=True,
     )
 
-    ckpt_path = run_dir / f"{cfg.output_model_name}_weights.ckpt"
     manager = spt.Manager(
         trainer=trainer,
         module=world_model,

@@ -58,3 +58,29 @@ class SaveCkptCallback(Callback):
             config=self.cfg,
             filename=f'weights_epoch_{epoch}.pt',
         )
+
+class StepCkptCallback(Callback):
+    """Save a full Lightning checkpoint (weights, optimizer, scheduler, step) every N steps to a
+    fixed path, which is the path train.py resumes from. Written to a temp file and renamed so a
+    runtime killed mid-write cannot leave a corrupt checkpoint."""
+
+    def __init__(self, path, every_n_steps: int):
+        super().__init__()
+        self.path = str(path)
+        self.every_n_steps = every_n_steps
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        step = trainer.global_step
+        if self.every_n_steps > 0 and step > 0 and step % self.every_n_steps == 0:
+            self._save(trainer)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if self.every_n_steps > 0:
+            self._save(trainer)
+
+    def _save(self, trainer):
+        import os
+        tmp = self.path + ".tmp"
+        trainer.save_checkpoint(tmp)  # all ranks must call this; Lightning writes on rank 0 only
+        if trainer.is_global_zero:
+            os.replace(tmp, self.path)
