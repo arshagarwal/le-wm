@@ -1,0 +1,65 @@
+# LeWM + CLAW latent action model. Select with `model=lewm_claw`.
+# (standalone copy of lewm.yaml: Hydra cannot drop the inherited action_encoder keys)
+_target_: jepa.JEPA
+
+encoder:
+  _target_: stable_pretraining.backbone.utils.vit_hf
+  size: tiny
+  patch_size: 14
+  image_size: ${img_size}
+  pretrained: false
+  use_mask_token: false
+
+predictor:
+  _target_: module.ARPredictor
+  num_frames: ${history_size}
+  input_dim: ${embed_dim}
+  hidden_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+
+projector:
+  _target_: module.MLP
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
+
+pred_proj:
+  _target_: module.MLP
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
+
+# real action -> latent z (input_dim is set in train.py from frameskip * action_dim)
+action_encoder:
+  _target_: module.GroundedActionEncoder
+  input_dim: ???
+  latent_dim: ${latent_dim}
+  hidden_dim: 256
+
+lam:
+  _target_: module.LatentActionModel
+  emb_dim: ${embed_dim}
+  latent_dim: ${latent_dim}
+  hidden_dim: 512
+
+# z -> predictor conditioning (shared by the main and adversarial passes)
+action_proj:
+  _target_: module.MLP
+  input_dim: ${latent_dim}
+  hidden_dim: 512
+  output_dim: ${embed_dim}
+
+emb_dim: ${embed_dim}
+detach_lam_input: false  # LAM gradients flow into the encoder
