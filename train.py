@@ -108,7 +108,18 @@ def run(cfg):
         dataset, lengths=[cfg.train_split, 1 - cfg.train_split], generator=rnd_gen
     )
 
-    train = torch.utils.data.DataLoader(train_set, **cfg.loader,shuffle=True, drop_last=True, generator=rnd_gen)
+    # Resume support: seed the shuffle with the step stored in the checkpoint so each restart sees a
+    # different order (the train/val split above keeps using cfg.seed alone, so it never changes).
+    run_id = cfg.get("subdir") or ""
+    run_dir = Path(swm.data.utils.get_cache_dir(sub_folder='checkpoints'), run_id)
+    ckpt_path = run_dir / f"{cfg.output_model_name}_weights.ckpt"
+    resumed_step = 0
+    if ckpt_path.exists():
+        resumed_step = int(torch.load(ckpt_path, map_location="cpu", weights_only=False)["global_step"])
+        print(f"resuming from step {resumed_step}: shuffle seed {cfg.seed + resumed_step}")
+    shuffle_gen = torch.Generator().manual_seed(cfg.seed + resumed_step)
+
+    train = torch.utils.data.DataLoader(train_set, **cfg.loader, shuffle=True, drop_last=True, generator=shuffle_gen)
     val = torch.utils.data.DataLoader(val_set, **cfg.loader, shuffle=False, drop_last=False)
     
     ##############################
@@ -138,9 +149,6 @@ def run(cfg):
     ##       training       ##
     ##########################
 
-    run_id = cfg.get("subdir") or ""
-    run_dir = Path(swm.data.utils.get_cache_dir(sub_folder='checkpoints'), run_id)
-
     logger = None
     if cfg.wandb.enabled:
         logger = WandbLogger(**cfg.wandb.config)
@@ -154,7 +162,6 @@ def run(cfg):
         run_name=cfg.output_model_name, cfg=cfg.model, epoch_interval=1,
     )
 
-    ckpt_path = run_dir / f"{cfg.output_model_name}_weights.ckpt"
     callbacks = [object_dump_callback]
     if cfg.get("ckpt_every_n_steps", 0) > 0:
         callbacks.append(StepCkptCallback(ckpt_path, cfg.ckpt_every_n_steps))
