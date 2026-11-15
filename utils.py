@@ -45,16 +45,50 @@ class SaveCkptCallback(Callback):
 
         if trainer.is_global_zero:
             if (trainer.current_epoch + 1) % self.epoch_interval == 0:
-                self._save(pl_module.model, trainer.current_epoch + 1)
+                self._save(pl_module, trainer.current_epoch + 1)
 
             if (trainer.current_epoch + 1) == trainer.max_epochs:
-                self._save(pl_module.model, trainer.current_epoch + 1)
+                self._save(pl_module, trainer.current_epoch + 1)
 
-    def _save(self, model, epoch):
+    def _save(self, pl_module, epoch):
+        from stable_worldmodel.data import get_cache_dir
         from stable_worldmodel.wm.utils import save_pretrained
+        # 1) the JEPA, exactly as before (loadable with load_pretrained)
         save_pretrained(
-            model,
+            pl_module.model,
             run_name=self.run_name,
             config=self.cfg,
             filename=f'weights_epoch_{epoch}.pt',
         )
+        # 2) the LAM (incl. its action projection) in a second file next to it
+        lam = getattr(pl_module, "lam", None)
+        if lam is not None:
+            ckpt_dir = get_cache_dir(None, sub_folder='checkpoints') / self.run_name
+            torch.save({"config": lam.config, "state_dict": lam.state_dict()}, ckpt_dir / f'lam_epoch_{epoch}.pt')
+
+
+class StepCkptCallback(Callback):
+    """Save a full Lightning checkpoint (weights, optimizer, scheduler, step) every N steps and at each
+    epoch end to a fixed path, which is the path train.py resumes from. Written to a temp file and renamed,
+    so a runtime killed mid-write cannot leave a corrupt checkpoint."""
+
+    def __init__(self, path, every_n_steps: int):
+        super().__init__()
+        self.path = str(path)
+        self.every_n_steps = every_n_steps
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        step = trainer.global_step
+        if self.every_n_steps > 0 and step > 0 and step % self.every_n_steps == 0:
+            self._save(trainer)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if self.every_n_steps > 0:
+            self._save(trainer)
+
+    def _save(self, trainer):
+        import os
+        tmp = self.path + ".tmp"
+        trainer.save_checkpoint(tmp)  # all ranks must call this; Lightning writes on rank 0 only
+        if trainer.is_global_zero:
+            os.replace(tmp, self.path)

@@ -12,7 +12,9 @@ train_split: 0.9
 seed: 3072
 img_size: 224
 embed_dim: 192
+latent_dim: 32
 history_size: 3
+ckpt_every_n_steps: 0  # >0: save a resumable checkpoint to checkpoints/<subdir>/<name>_weights.ckpt every N steps
 
 trainer:
   max_epochs: 100

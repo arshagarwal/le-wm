@@ -1,5 +1,7 @@
 """JEPA Implementation"""
 
+import math
+
 import torch
 import torch.nn.functional as F
 from einops import rearrange
@@ -151,3 +153,54 @@ class JEPA(nn.Module):
         cost = self.criterion(info_dict)
         
         return cost
+
+
+class LAM(nn.Module):
+    """Latent action model: an MLP on two consecutive frame embeddings.
+
+    forward(emb_t, emb_next) -> z, a unit-norm latent action (latent_dim).
+    cond(z) -> the cond_dim vector the predictor takes in place of the real-action embedding.
+    Works on any leading shape (B, T, D) because it only touches the last dim.
+    """
+
+    def __init__(self, emb_dim=192, latent_dim=32, hidden_dim=512, cond_dim=192):
+        super().__init__()
+        self.config = dict(emb_dim=emb_dim, latent_dim=latent_dim, hidden_dim=hidden_dim, cond_dim=cond_dim)
+        self.net = nn.Sequential(
+            nn.Linear(2 * emb_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+        self.proj = nn.Sequential(
+            nn.Linear(latent_dim, cond_dim), nn.LayerNorm(cond_dim), nn.GELU(),
+            nn.Linear(cond_dim, cond_dim),
+        )
+
+    def forward(self, emb_t, emb_next):
+        z = self.net(torch.cat([emb_t, emb_next], dim=-1))
+        return F.normalize(z, dim=-1)
+
+    def cond(self, z):
+        return self.proj(z)
+
+
+class _GradReverse(torch.autograd.Function):
+    """Identity in the forward pass; multiplies the gradient by -scale in the backward pass."""
+
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return -ctx.scale * grad, None
+
+
+def grad_reverse(x, scale):
+    return _GradReverse.apply(x, scale)
+
+
+def adv_delta(progress, gamma=10.0, max_delta=0.999):
+    """CLAW adversarial weight: min(2 / (1 + exp(-gamma * p)) - 1, max_delta), p = training progress in [0, 1]."""
+    return min(2.0 / (1.0 + math.exp(-gamma * progress)) - 1.0, max_delta)
