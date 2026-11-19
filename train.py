@@ -7,7 +7,9 @@ import lightning as pl
 import stable_pretraining as spt
 import stable_worldmodel as swm
 import torch
-from lightning.pytorch.loggers import WandbLogger
+import torch.nn as nn
+import torch.nn.functional as F
+from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 from omegaconf import OmegaConf, open_dict
 
 from jepa import LAM, adv_delta, grad_reverse
@@ -22,15 +24,13 @@ def lejepa_forward(self, batch, stage, cfg):
     n_preds = cfg.num_preds
     lambd = cfg.loss.sigreg.weight
 
-    # CLAW: real actions are not used. encode() only runs the action encoder if "action" is in its input.
-    output = self.model.encode({"pixels": batch["pixels"]})
-
-    emb = output["emb"]  # (B, T, D)
-
-    # CLAW: latent action z_t from consecutive frame embeddings (emb_t, emb_{t+1}), fed to the predictor
-    # in place of the real-action embedding. T = ctx_len + 1, so there are ctx_len latent actions.
+    # CLAW: real actions are not used. The LAM reads the patch tokens of consecutive frames and gives the
+    # latent action z_t for the step t -> t+1, which is fed to the predictor in place of the real-action
+    # embedding. T = ctx_len + 1, so there are ctx_len latent actions.
     assert n_preds == 1, "latent actions assume num_preds == 1"
-    z = self.lam(emb[:, :-1], emb[:, 1:])  # (B, T-1, latent_dim), unit norm
+    output = self.model.encode({"pixels": batch["pixels"]}, patches=True)
+    emb, tokens = output["emb"], output["patch_emb"]  # (B, T, D), (B, T, N, D)
+    z = self.lam(tokens[:, :-1], tokens[:, 1:])  # (B, T-1, latent_dim), unit norm
     ctx_act = self.lam.cond(z)[:, :ctx_len]  # (B, ctx_len, D)
 
     ctx_emb = emb[:, :ctx_len]
@@ -38,19 +38,40 @@ def lejepa_forward(self, batch, stage, cfg):
     tgt_emb = emb[:, n_preds:] # label
     pred_emb = self.model.predict(ctx_emb, ctx_act) # pred
 
-    # CLAW adversary: predict the same target from z alone (context frames replaced by zeros).
-    # The gradient reversal makes the LAM (and encoder) remove whatever lets z alone predict the next frame.
-    trainer = getattr(self, "trainer", None)
-    progress = trainer.global_step / max(trainer.estimated_stepping_batches, 1) if trainer is not None else 0.0
-    delta = adv_delta(progress)
-    adv_act = self.lam.cond(grad_reverse(z, delta))[:, :ctx_len]
-    adv_pred = self.model.predict(torch.zeros_like(ctx_emb), adv_act)
+    # ---- ACTION vs PREDICTION SIMILARITY START (monitoring only) -------------------------------------
+    # z is 32-d and pred_emb is 192-d, so compare the conditioning vector cond(z) (= ctx_act, 192-d) with
+    # the predicted embedding, both L2-normalised: L1 distance (sum over dims) and cosine similarity.
+    a, p = F.normalize(ctx_act.detach(), dim=-1), F.normalize(pred_emb.detach(), dim=-1)
+    self.log_dict({f"{stage}/act_pred_l1": (a - p).abs().sum(-1).mean(), f"{stage}/act_pred_cos": (a * p).sum(-1).mean()}, on_step=True, sync_dist=True)
+    # ---- ACTION vs PREDICTION SIMILARITY END ---------------------------------------------------------
 
-    # LeWM loss + adversarial loss
+    # ---- STATE PROBE START (monitoring only) --------------------------------------------------------
+    # L1 error of reading the true state (agent xy, block xy, block angle) out of the PREDICTED embedding
+    # ("pred") and, as a reference, out of the encoder's own embedding of the same frame ("true"). Inputs are
+    # detached, so only the two linear probe heads are trained. Plot the two together (see TENSORBOARD below).
+    state = torch.nan_to_num(batch["state"][:, n_preds:, :5])  # (B, ctx_len, 5): state of each target frame
+    for name, x in (("pred", pred_emb), ("true", tgt_emb)):
+        output[f"probe_{name}_loss"] = F.l1_loss(self.probe[name](x.detach()), state)
+    # ---- STATE PROBE END ----------------------------------------------------------------------------
+
+    # ADVERSARIAL LOSS DISABLED for this experiment (LAM-only run). Uncomment the block below and the
+    # two adv_loss lines to bring it back.
+    # # CLAW adversary: predict the same target from z alone (context frames replaced by zeros).
+    # # The gradient reversal makes the LAM (and encoder) remove whatever lets z alone predict the next frame.
+    # trainer = getattr(self, "trainer", None)
+    # progress = trainer.global_step / max(trainer.estimated_stepping_batches, 1) if trainer is not None else 0.0
+    # delta = adv_delta(progress)
+    # adv_act = self.lam.cond(grad_reverse(z, delta))[:, :ctx_len]
+    # adv_pred = self.model.predict(torch.zeros_like(ctx_emb), adv_act)
+
+    # LeWM loss (+ adversarial loss when enabled)
     output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
     output["sigreg_loss"]= self.sigreg(emb.transpose(0, 1))
-    output["adv_loss"] = (adv_pred - tgt_emb.detach()).pow(2).mean()
-    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"] + output["adv_loss"]
+    # output["adv_loss"] = (adv_pred - tgt_emb.detach()).pow(2).mean()
+    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]  # + output["adv_loss"]
+    # STATE PROBE: add the probe losses so the probe heads get trained (their inputs are detached, so this
+    # adds no gradient to anything else). NOTE: "loss" now includes these two small terms.
+    output["loss"] = output["loss"] + output["probe_pred_loss"] + output["probe_true_loss"]
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
@@ -107,10 +128,13 @@ def run(cfg):
 
     world_model = hydra.utils.instantiate(cfg.model)
     lam = LAM(emb_dim=cfg.embed_dim, latent_dim=cfg.latent_dim, cond_dim=cfg.embed_dim)
+    # ---- STATE PROBE START: two linear heads, embedding -> 5 state values (see lejepa_forward) ----
+    probe = nn.ModuleDict({k: nn.Linear(cfg.embed_dim, 5) for k in ("pred", "true")})
+    # ---- STATE PROBE END ----
 
     optimizers = {
         'model_opt': {
-            "modules": 'model|lam',
+            "modules": 'model|lam|probe',  # probe: STATE PROBE heads
             "optimizer": dict(cfg.optimizer),
             "scheduler": {"type": "LinearWarmupCosineAnnealingLR"},
             "interval": "epoch",
@@ -121,6 +145,7 @@ def run(cfg):
     world_model = spt.Module(
         model = world_model,
         lam = lam,
+        probe = probe,  # STATE PROBE
         sigreg = SIGReg(**cfg.loss.sigreg.kwargs),
         forward=partial(lejepa_forward, cfg=cfg),
         optim=optimizers,
@@ -134,6 +159,18 @@ def run(cfg):
     if cfg.wandb.enabled:
         logger = WandbLogger(**cfg.wandb.config)
         logger.log_hyperparams(OmegaConf.to_container(cfg))
+    # ---- TENSORBOARD START: live charts. version=0 makes a resumed run continue the same curves. ----
+    elif cfg.tensorboard.enabled:
+        logger = TensorBoardLogger(
+            save_dir=cfg.tensorboard.save_dir, name=cfg.output_model_name, version=0,
+            flush_secs=cfg.tensorboard.flush_secs,
+        )
+        # draw the pred and true probe curves on ONE chart (TensorBoard tab "Custom Scalars")
+        logger.experiment.add_custom_scalars({"state probe (L1)": {
+            "train": ["Multiline", ["fit/probe_pred_loss", "fit/probe_true_loss"]],
+            "val": ["Multiline", ["validate/probe_pred_loss_epoch", "validate/probe_true_loss_epoch"]],
+        }})
+    # ---- TENSORBOARD END ----
 
     run_dir.mkdir(parents=True, exist_ok=True)
     with open(run_dir / "config.yaml", "w") as f:

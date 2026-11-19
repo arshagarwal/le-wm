@@ -28,9 +28,11 @@ class JEPA(nn.Module):
         self.projector = projector or nn.Identity()
         self.pred_proj = pred_proj or nn.Identity()
 
-    def encode(self, info):
+    def encode(self, info, patches=False):  # CLAW CHANGE: `patches` argument added
         """Encode observations and actions into embeddings.
         info: dict with pixels and action keys
+        patches: also return the ViT patch tokens as info["patch_emb"], (B, T, num_patches, D). Off by default,
+                 so existing callers get exactly the same outputs as before.
         """
 
         pixels = info['pixels'].float()
@@ -40,6 +42,10 @@ class JEPA(nn.Module):
         pixels_emb = output.last_hidden_state[:, 0]  # cls token
         emb = self.projector(pixels_emb)
         info["emb"] = rearrange(emb, "(b t) d -> b t d", b=b)
+        # ---- CLAW CHANGE START: optionally also return the ViT patch tokens (off by default) ----
+        if patches:
+            info["patch_emb"] = rearrange(output.last_hidden_state[:, 1:], "(b t) n d -> b t n d", b=b)
+        # ---- CLAW CHANGE END ----
 
         if "action" in info:
             info["act_emb"] = self.action_encoder(info["action"])
@@ -155,35 +161,6 @@ class JEPA(nn.Module):
         return cost
 
 
-class LAM(nn.Module):
-    """Latent action model: an MLP on two consecutive frame embeddings.
-
-    forward(emb_t, emb_next) -> z, a unit-norm latent action (latent_dim).
-    cond(z) -> the cond_dim vector the predictor takes in place of the real-action embedding.
-    Works on any leading shape (B, T, D) because it only touches the last dim.
-    """
-
-    def __init__(self, emb_dim=192, latent_dim=32, hidden_dim=512, cond_dim=192):
-        super().__init__()
-        self.config = dict(emb_dim=emb_dim, latent_dim=latent_dim, hidden_dim=hidden_dim, cond_dim=cond_dim)
-        self.net = nn.Sequential(
-            nn.Linear(2 * emb_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(),
-            nn.Linear(hidden_dim, latent_dim),
-        )
-        self.proj = nn.Sequential(
-            nn.Linear(latent_dim, cond_dim), nn.LayerNorm(cond_dim), nn.GELU(),
-            nn.Linear(cond_dim, cond_dim),
-        )
-
-    def forward(self, emb_t, emb_next):
-        z = self.net(torch.cat([emb_t, emb_next], dim=-1))
-        return F.normalize(z, dim=-1)
-
-    def cond(self, z):
-        return self.proj(z)
-
-
 class _GradReverse(torch.autograd.Function):
     """Identity in the forward pass; multiplies the gradient by -scale in the backward pass."""
 
@@ -204,3 +181,69 @@ def grad_reverse(x, scale):
 def adv_delta(progress, gamma=10.0, max_delta=0.999):
     """CLAW adversarial weight: min(2 / (1 + exp(-gamma * p)) - 1, max_delta), p = training progress in [0, 1]."""
     return min(2.0 / (1.0 + math.exp(-gamma * progress)) - 1.0, max_delta)
+
+
+class _SelfBlock(nn.Module):
+    """Pre-norm transformer block with (bidirectional) self-attention."""
+
+    def __init__(self, dim, heads, mlp_ratio=4.0):
+        super().__init__()
+        self.norm1, self.norm2 = nn.LayerNorm(dim), nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.mlp = nn.Sequential(nn.Linear(dim, int(dim * mlp_ratio)), nn.GELU(), nn.Linear(int(dim * mlp_ratio), dim))
+
+    def forward(self, x):
+        h = self.norm1(x)
+        x = x + self.attn(h, h, h, need_weights=False)[0]
+        return x + self.mlp(self.norm2(x))
+
+
+class _CrossBlock(nn.Module):
+    """V-JEPA 2's last probe block: the query token cross-attends to the tokens, then a residual MLP."""
+
+    def __init__(self, dim, heads, mlp_ratio=4.0):
+        super().__init__()
+        self.norm1, self.norm2 = nn.LayerNorm(dim), nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.mlp = nn.Sequential(nn.Linear(dim, int(dim * mlp_ratio)), nn.GELU(), nn.Linear(int(dim * mlp_ratio), dim))
+
+    def forward(self, q, x):
+        kv = self.norm1(x)
+        q = q + self.attn(q, kv, kv, need_weights=False)[0]
+        return q + self.mlp(self.norm2(q))
+
+
+class LAM(nn.Module):
+    """Latent action model: an attentive probe (V-JEPA 2) over the encoder's patch tokens.
+
+    forward(tok_t, tok_next) -> z: tokens (..., N, D) of two consecutive frames -> unit-norm latent action.
+    The tokens of both frames form one sequence (plus a learned marker saying which frame each belongs to),
+    go through depth-1 self-attention blocks, then a learnable query cross-attends to all of them (the last
+    block), and a linear layer maps the query to latent_dim. cond(z) projects z to the vector the predictor
+    takes in place of the real-action embedding.
+    """
+
+    def __init__(self, emb_dim=192, latent_dim=32, cond_dim=192, depth=4, heads=4, mlp_ratio=4.0):
+        super().__init__()
+        self.config = dict(emb_dim=emb_dim, latent_dim=latent_dim, cond_dim=cond_dim,
+                           depth=depth, heads=heads, mlp_ratio=mlp_ratio)
+        self.frame_embed = nn.Parameter(torch.randn(2, emb_dim) * 0.02)  # which frame a token comes from
+        self.blocks = nn.ModuleList([_SelfBlock(emb_dim, heads, mlp_ratio) for _ in range(depth - 1)])
+        self.query = nn.Parameter(torch.randn(1, 1, emb_dim) * 0.02)
+        self.cross = _CrossBlock(emb_dim, heads, mlp_ratio)
+        self.head = nn.Linear(emb_dim, latent_dim)
+        self.proj = nn.Sequential(
+            nn.Linear(latent_dim, cond_dim), nn.LayerNorm(cond_dim), nn.GELU(), nn.Linear(cond_dim, cond_dim),
+        )
+
+    def forward(self, tok_t, tok_next):
+        lead = tok_t.shape[:-2]
+        x = torch.cat([tok_t + self.frame_embed[0], tok_next + self.frame_embed[1]], dim=-2)  # (..., 2N, D)
+        x = x.reshape(-1, *x.shape[-2:])
+        for blk in self.blocks:
+            x = blk(x)
+        q = self.cross(self.query.expand(len(x), -1, -1), x)[:, 0]
+        return F.normalize(self.head(q), dim=-1).reshape(*lead, -1)
+
+    def cond(self, z):
+        return self.proj(z)

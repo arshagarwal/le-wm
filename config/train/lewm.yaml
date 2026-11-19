@@ -43,3 +43,9 @@ loss:
     kwargs:
       knots: 17
       num_proj: 1024
+
+# live logging (TensorBoard); `tensorboard --logdir <save_dir>` shows <save_dir>/<output_model_name>/version_0
+tensorboard:
+  enabled: false
+  save_dir: tb_logs
+  flush_secs: 30

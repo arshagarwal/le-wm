@@ -43,15 +43,15 @@ def build_lookup(model, lam, loader, device="cpu"):
     """Map latent actions to real actions: run reference windows through the encoder and LAM.
 
     Each batch holds `pixels` (B, T, C, H, W) and `action` (B, T, A). The latent action z_t comes from
-    (emb_t, emb_{t+1}) and describes the transition t -> t+1, so it is paired with action[t] (t < T-1).
+    the patch tokens of frames t and t+1 and describes the transition t -> t+1, so it is paired with action[t] (t < T-1).
     Returns z_bank (N, latent_dim) and a_bank (N, A); actions stay in the normalised space of training.
     """
     model.eval()
     lam.eval()
     zs, acts = [], []
     for batch in loader:
-        emb = model.encode({"pixels": batch["pixels"].to(device)})["emb"]  # (B, T, D)
-        z = lam(emb[:, :-1], emb[:, 1:])  # (B, T-1, latent_dim)
+        tokens = model.encode({"pixels": batch["pixels"].to(device)}, patches=True)["patch_emb"]  # (B, T, N, D)
+        z = lam(tokens[:, :-1], tokens[:, 1:])  # (B, T-1, latent_dim)
         a = batch["action"][:, :-1].to(device)  # (B, T-1, A)
         z, a = z.reshape(-1, z.shape[-1]), a.reshape(-1, a.shape[-1])
         ok = ~torch.isnan(a).any(dim=-1)  # windows crossing an episode end carry NaN actions
